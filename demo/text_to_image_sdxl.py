@@ -3,14 +3,19 @@ from main.sdxl.sdxl_text_encoder import SDXLTextEncoder
 from main.utils import get_x0_from_noise
 from transformers import AutoTokenizer
 from accelerate import Accelerator
-import gradio as gr    
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 import numpy as np
 import argparse 
 import torch
 import time 
-import PIL
-    
-SAFETY_CHECKER = False
+import cv2
+from safety_checker.censor import check_safety
+import io
+import uvicorn
+import base64
+
+SAFETY_CHECKER = True
 
 class ModelWrapper:
     def __init__(self, args, accelerator):
@@ -52,11 +57,9 @@ class ModelWrapper:
         self.model = self.create_generator(args).to(dtype=self.DTYPE).to(self.device)
 
         self.accelerator = accelerator
-        self.image_resolution = args.image_resolution
         self.latent_resolution = args.latent_resolution
         self.num_train_timesteps = args.num_train_timesteps
 
-        self.base_add_time_ids = self.build_condition_input()
         self.conditioning_timestep = args.conditioning_timestep 
 
         self.scheduler = DDIMScheduler.from_pretrained(
@@ -69,26 +72,6 @@ class ModelWrapper:
         self.num_step = args.num_step 
         self.conditioning_timestep = args.conditioning_timestep 
 
-        # safety checker 
-        if SAFETY_CHECKER:
-            # adopted from https://huggingface.co/spaces/ByteDance/SDXL-Lightning/raw/main/app.py
-            from demo.safety_checker import StableDiffusionSafetyChecker
-            from transformers import CLIPFeatureExtractor
-
-            self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-                "CompVis/stable-diffusion-safety-checker"
-            ).to(self.device)
-            self.feature_extractor = CLIPFeatureExtractor.from_pretrained(
-                "openai/clip-vit-base-patch32", 
-            )
-
-    def check_nsfw_images(self, images):
-        safety_checker_input = self.feature_extractor(images, return_tensors="pt") # .to(self.dviece)
-        has_nsfw_concepts = self.safety_checker(
-            clip_input=safety_checker_input.pixel_values.to(self.device),
-            images=images
-        )
-        return has_nsfw_concepts
 
     def create_generator(self, args):
         generator = UNet2DConditionModel.from_pretrained(
@@ -101,18 +84,18 @@ class ModelWrapper:
         generator.requires_grad_(False)
         return generator 
 
-    def build_condition_input(self):
-        original_size = (self.image_resolution, self.image_resolution)
-        target_size = (self.image_resolution, self.image_resolution)
+    def build_condition_input(self, width, height):
+        original_size = (width, height)
+        target_size = (width, height)
         crop_top_left = (0, 0)
 
         add_time_ids = list(original_size + crop_top_left + target_size)
         add_time_ids = torch.tensor([add_time_ids], device=self.device, dtype=self.DTYPE)
         return add_time_ids
 
-    def _encode_prompt(self, prompt):
+    def _encode_prompts(self, prompts):
         text_input_ids_one = self.tokenizer_one(
-            [prompt],
+            prompts,
             padding="max_length",
             max_length=self.tokenizer_one.model_max_length,
             truncation=True,
@@ -120,7 +103,7 @@ class ModelWrapper:
         ).input_ids
 
         text_input_ids_two = self.tokenizer_two(
-            [prompt],
+            prompts,
             padding="max_length",
             max_length=self.tokenizer_two.model_max_length,
             truncation=True,
@@ -128,11 +111,11 @@ class ModelWrapper:
         ).input_ids
 
         prompt_dict = {
-            'text_input_ids_one': text_input_ids_one.unsqueeze(0).to(self.device),
-            'text_input_ids_two': text_input_ids_two.unsqueeze(0).to(self.device)
+            'text_input_ids_one': text_input_ids_one.to(self.device),
+            'text_input_ids_two': text_input_ids_two.to(self.device)
         }
         return prompt_dict 
-
+    
     @staticmethod
     def _get_time():
         torch.cuda.synchronize()
@@ -173,136 +156,185 @@ class ModelWrapper:
         eval_images = ((eval_images + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1)
         return eval_images 
 
-
     @torch.no_grad()
     def inference(
         self,
-        prompt: str,
+        prompts: list,
         seed: int,
-        num_images: int=1,
+        width: int,
+        height: int
     ):
-        print("Running model inference...")
+        num_images = len(prompts)
+        print(f"Running model inference... images: {num_images}")
 
         if seed == -1:
             seed = np.random.randint(0, 1000000)
 
         generator = torch.manual_seed(seed)
 
-        add_time_ids = self.base_add_time_ids.repeat(num_images, 1)
+        base_add_time_ids = self.build_condition_input(width, height)
+
+        add_time_ids = base_add_time_ids.repeat(num_images, 1)
 
         noise = torch.randn(
-            num_images, 4, self.latent_resolution, self.latent_resolution, 
+            num_images, 4, height // 8, width // 8, 
             generator=generator
         ).to(device=self.device, dtype=self.DTYPE) 
 
-        prompt_inputs = self._encode_prompt(prompt)
-        
-        start_time = self._get_time()
+        # Log the start time for encoding prompts
+        encode_start_time = self._get_time()
+        prompt_inputs = self._encode_prompts(prompts)
+        encode_end_time = self._get_time()
+        print(f"Encoding prompts took {(encode_end_time - encode_start_time):.2f} seconds")
 
-        prompt_embeds, pooled_prompt_embeds = self.text_encoder(prompt_inputs)
-
-        batch_prompt_embeds, batch_pooled_prompt_embeds = (
-            prompt_embeds.repeat(num_images, 1, 1),
-            pooled_prompt_embeds.repeat(num_images, 1, 1)
-        )
+        # Log the start time for text encoding
+        text_encode_start_time = self._get_time()
+        batch_prompt_embeds, batch_pooled_prompt_embeds = self.text_encoder(prompt_inputs)
+        text_encode_end_time = self._get_time()
+        print(f"Text encoding took {(text_encode_end_time - text_encode_start_time):.2f} seconds")
 
         unet_added_conditions = {
             "time_ids": add_time_ids,
             "text_embeds": batch_pooled_prompt_embeds.squeeze(1)
         }
 
+        # Log the start time for sampling
+        sample_start_time = self._get_time()
         eval_images = self.sample(
             noise=noise,
             unet_added_conditions=unet_added_conditions,
             prompt_embed=batch_prompt_embeds
         )
-
-        end_time = self._get_time()
+        sample_end_time = self._get_time()
+        print(f"Sampling images took {(sample_end_time - sample_start_time):.2f} seconds")
 
         output_image_list = [] 
         for image in eval_images:
-            output_image_list.append(PIL.Image.fromarray(image.cpu().numpy()))
+            image_np = image.cpu().numpy()
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+            output_image_list.append(image_bgr)
 
-        if SAFETY_CHECKER:
-            has_nsfw_concepts = self.check_nsfw_images(output_image_list)
-            if any(has_nsfw_concepts):
-                return [PIL.Image.new("RGB", (512, 512))], "NSFW concepts detected. Please try a different prompt."
+        # Log the total inference time
+        total_inference_time = sample_end_time - encode_start_time
+        print(f"Total inference time: {total_inference_time:.2f} seconds")
 
-        return (
-            output_image_list,
-            f"run successfully in {(end_time-start_time):.2f} seconds"
-        )
+        return output_image_list, eval_images
 
+app = FastAPI()
 
-def create_demo():
-    TITLE = "# DMD2-SDXL Demo"
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--latent_resolution", type=int, default=128)
-    parser.add_argument("--image_resolution", type=int, default=1024)
-    parser.add_argument("--num_train_timesteps", type=int, default=1000)
-    parser.add_argument("--checkpoint_path", type=str)
-    parser.add_argument("--model_id", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
-    parser.add_argument("--precision", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
-    parser.add_argument("--use_tiny_vae", action="store_true")
-    parser.add_argument("--conditioning_timestep", type=int, default=999)
-    parser.add_argument("--num_step", type=int, default=4, choices=[1, 4])
-    parser.add_argument("--revision", type=str)
-    args = parser.parse_args()
+# Initialize model once at startup
+args = argparse.Namespace(
+    latent_resolution=128,
+    num_train_timesteps=1000,
+    checkpoint_path='./sdxl_cond999.bin',
+    model_id='stabilityai/stable-diffusion-xl-base-1.0',
+    precision='float16',
+    use_tiny_vae=True,
+    conditioning_timestep=999,
+    num_step=4,
+    revision=None
+)
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True 
 
-    accelerator = Accelerator()
+accelerator = Accelerator()
+model = ModelWrapper(args, accelerator)
 
-    model = ModelWrapper(args, accelerator)
+@app.post('/generate')
+async def generate(request: Request):
+    data = await request.json()
+    prompts = data.get('prompts', ['children'])
 
-    with gr.Blocks() as demo:
-        gr.Markdown(TITLE)
-        with gr.Row():
-            with gr.Column():
-                prompt = gr.Text(
-                    value="children",
-                    label="Prompt",
-                    placeholder='e.g. children'
-                )
-                run_button = gr.Button("Run")
-                with gr.Accordion(label="Advanced options", open=False):
-                    seed = gr.Slider(
-                        label="Seed",
-                        minimum=-1,
-                        maximum=1000000,
-                        step=1,
-                        value=0,
-                        info="If set to -1, a different seed will be used each time.",
-                    )
-                    num_images = gr.Slider(
-                        label="Number of generated images",
-                        minimum=1,
-                        maximum=16,
-                        step=1,
-                        value=1,
-                    )
-            with gr.Column():
-                result = gr.Gallery(label="Generated Images", show_label=False, elem_id="gallery", height=1024)
+    def convert_to_int(value, default):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
 
-                error_message = gr.Text(label="Job Status")
+    width = convert_to_int(data.get('width', 1024), 1024)
+    height = convert_to_int(data.get('height', 1024), 1024)
+    seed = convert_to_int(data.get('seed', -1), -1)
 
-        inputs = [
-            prompt,
-            seed,
-            num_images
-        ]
-        run_button.click(
-            fn=model.inference, inputs=inputs, outputs=[result, error_message]
-        )
-    return demo
+    # Log the start time for the entire request processing
+    request_start_time = time.time()
 
+    # Log the start time for the entire inference process
+    inference_start_time = time.time()
+
+    # Generate images for each prompt
+    all_images, all_images_tensor = model.inference(prompts, seed, width, height)
+
+    # Log the end time for the entire inference process
+    inference_end_time = time.time()
+    total_inference_time = inference_end_time - inference_start_time
+    print(f"Total inference time: {total_inference_time:.2f} seconds")
+
+    if not all_images:
+        return JSONResponse(content={"error": "No images generated"}, status_code=500)
+
+    response_content = []
+    total_image_creation_time = 0
+    total_safety_check_time = 0
+
+    # Log the start time for image creation
+    image_creation_start_time = time.time()
+
+    # Process images in batch
+    img_byte_arr_list = []
+    for image in all_images:
+        img_byte_arr = io.BytesIO()
+        _, img_encoded = cv2.imencode('.png', image)
+        img_byte_arr.write(img_encoded.tobytes())
+        img_byte_arr_list.append(img_byte_arr.getvalue())
+
+    # Convert images to base64
+    img_base64_list = [base64.b64encode(img_byte_arr).decode('utf-8') for img_byte_arr in img_byte_arr_list]
+
+    # Log the end time for image creation
+    image_creation_end_time = time.time()
+    image_creation_time = image_creation_end_time - image_creation_start_time
+    total_image_creation_time += image_creation_time
+    print(f"Image creation time: {image_creation_time:.2f} seconds")
+
+    # Log the start time for the safety checker
+    safety_check_start_time = time.time()
+
+    concepts, has_nsfw_concepts_list = check_safety(all_images_tensor, safety_checker_adj=0.0)
+
+    # Log the end time for the safety checker
+    safety_check_end_time = time.time()
+    safety_check_time = safety_check_end_time - safety_check_start_time
+    total_safety_check_time += safety_check_time
+    print(f"Safety check time: {safety_check_time:.2f} seconds")
+
+    for img_base64, prompt, has_nsfw_concept, concept in zip(img_base64_list, prompts, has_nsfw_concepts_list, concepts):
+        image_content = {
+            "image": img_base64,
+            "has_nsfw_concept": has_nsfw_concept,
+            "concept": concept,
+            "width": width,
+            "height": height,
+            "seed": seed,
+            "prompt": prompt
+        }
+
+        response_content.append(image_content)
+
+    # Log the end time for the entire request processing
+    request_end_time = time.time()
+    total_request_time = request_end_time - request_start_time
+    average_image_creation_time = total_image_creation_time / len(all_images)
+    average_safety_check_time = total_safety_check_time / len(all_images) if SAFETY_CHECKER else 0
+    average_total_time_per_image = (total_inference_time + total_image_creation_time + total_safety_check_time) / len(all_images)
+
+    print(f"Total request time: {total_request_time:.2f} seconds")
+    print(f"Average image creation time: {average_image_creation_time:.2f} seconds")
+    print(f"Average safety check time: {average_safety_check_time:.2f} seconds")
+    print(f"Average total time per image: {average_total_time_per_image:.2f} seconds")
+
+    return JSONResponse(content=response_content, media_type="application/json")
 
 if __name__ == "__main__":
-    demo = create_demo()
-    demo.queue(api_open=True)
-    demo.launch(
-        server_name="0.0.0.0",
-        show_error=True,
-        share=True
-    )
+    uvicorn.run(app, host='0.0.0.0', port=5000)
+
