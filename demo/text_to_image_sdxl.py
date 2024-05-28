@@ -17,6 +17,11 @@ import base64
 
 SAFETY_CHECKER = True
 
+# Global variables to track time
+total_request_time_accumulated = 0
+first_request_time = None
+request_count = 0
+
 class ModelWrapper:
     def __init__(self, args, accelerator):
         super().__init__()
@@ -243,6 +248,8 @@ model = ModelWrapper(args, accelerator)
 
 @app.post('/generate')
 async def generate(request: Request):
+    global total_request_time_accumulated, first_request_time, request_count
+
     data = await request.json()
     prompts = data.get('prompts', ['children'])
 
@@ -259,16 +266,8 @@ async def generate(request: Request):
     # Log the start time for the entire request processing
     request_start_time = time.time()
 
-    # Log the start time for the entire inference process
-    inference_start_time = time.time()
-
     # Generate images for each prompt
     all_images, all_images_tensor = model.inference(prompts, seed, width, height)
-
-    # Log the end time for the entire inference process
-    inference_end_time = time.time()
-    total_inference_time = inference_end_time - inference_start_time
-    print(f"Total inference time: {total_inference_time:.2f} seconds")
 
     if not all_images:
         return JSONResponse(content={"error": "No images generated"}, status_code=500)
@@ -299,9 +298,9 @@ async def generate(request: Request):
 
     # Log the start time for the safety checker
     safety_check_start_time = time.time()
-
+    print("starting safety check")
     concepts, has_nsfw_concepts_list = check_safety(all_images_tensor, safety_checker_adj=0.0)
-
+    print("end safety check")
     # Log the end time for the safety checker
     safety_check_end_time = time.time()
     safety_check_time = safety_check_end_time - safety_check_start_time
@@ -324,17 +323,25 @@ async def generate(request: Request):
     # Log the end time for the entire request processing
     request_end_time = time.time()
     total_request_time = request_end_time - request_start_time
-    average_image_creation_time = total_image_creation_time / len(all_images)
-    average_safety_check_time = total_safety_check_time / len(all_images) if SAFETY_CHECKER else 0
-    average_total_time_per_image = (total_inference_time + total_image_creation_time + total_safety_check_time) / len(all_images)
+
+    # Update global time accumulators and request count
+    total_request_time_accumulated += total_request_time
+    request_count += 1
+
+    # Record the time of the first request
+    if first_request_time is None:
+        first_request_time = request_start_time
+
+    # Calculate the total time passed since the first request
+    total_time_passed = request_end_time - first_request_time
+
+    # Calculate the percentage of time spent processing requests
+    percentage_time_processing = (total_request_time_accumulated / total_time_passed) * 100
 
     print(f"Total request time: {total_request_time:.2f} seconds")
-    print(f"Average image creation time: {average_image_creation_time:.2f} seconds")
-    print(f"Average safety check time: {average_safety_check_time:.2f} seconds")
-    print(f"Average total time per image: {average_total_time_per_image:.2f} seconds")
+    print(f"Percentage of time spent processing requests: {percentage_time_processing:.2f}%")
 
     return JSONResponse(content=response_content, media_type="application/json")
 
 if __name__ == "__main__":
     uvicorn.run(app, host='0.0.0.0', port=5000)
-
