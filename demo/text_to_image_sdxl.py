@@ -1,19 +1,37 @@
-from diffusers import UNet2DConditionModel, AutoencoderKL, DDIMScheduler, AutoencoderTiny
-from main.sdxl.sdxl_text_encoder import SDXLTextEncoder
-from main.utils import get_x0_from_noise
-from transformers import AutoTokenizer
-from accelerate import Accelerator
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-import numpy as np
-import argparse 
 import torch
-import time 
-import cv2
-from safety_checker.censor import check_safety
+from diffusers import DiffusionPipeline, UNet2DConditionModel, LCMScheduler, AutoencoderTiny, DDIMScheduler
+from huggingface_hub import hf_hub_download
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import time
 import io
-import uvicorn
 import base64
+import cv2
+import numpy as np
+from safety_checker.censor import check_safety
+import uvicorn
+import os
+from hidiffusion import apply_hidiffusion, remove_hidiffusion
+from compel import Compel, ReturnedEmbeddingsType
+
+base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+repo_name = "tianweiy/DMD2"
+ckpt_name = "dmd2_sdxl_4step_unet_fp16.bin"
+
+# Load model
+unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet").to("cuda", torch.float16)
+unet.load_state_dict(torch.load(hf_hub_download(repo_name, ckpt_name), map_location="cuda"))
+# apply_hidiffusion(unet)
+pipe = DiffusionPipeline.from_pretrained(base_model_id, unet=unet, torch_dtype=torch.float16, variant="fp16").to("cuda")
+pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16).to("cuda", torch.float16)
+
+compel = Compel(
+  tokenizer=[pipe.tokenizer, pipe.tokenizer_2] ,
+  text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+  returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+  requires_pooled=[False, True]
+)
 
 SAFETY_CHECKER = True
 
@@ -22,229 +40,7 @@ total_request_time_accumulated = 0
 first_request_time = None
 request_count = 0
 
-class ModelWrapper:
-    def __init__(self, args, accelerator):
-        super().__init__()
-        # disable all gradient calculations
-        torch.set_grad_enabled(False)
-        
-        if args.precision == "bfloat16":
-            self.DTYPE = torch.bfloat16
-        elif args.precision == "float16":
-            self.DTYPE = torch.float16
-        else:
-            self.DTYPE = torch.float32
-        self.device = accelerator.device
-
-        self.tokenizer_one = AutoTokenizer.from_pretrained(
-            args.model_id, subfolder="tokenizer", revision=args.revision, use_fast=False
-        )
-
-        self.tokenizer_two = AutoTokenizer.from_pretrained(
-            args.model_id, subfolder="tokenizer", revision=args.revision, use_fast=False
-        )
-
-        self.text_encoder = SDXLTextEncoder(args, accelerator).to(dtype=self.DTYPE)
-
-        # Initialize AutoEncoder with specified model and dtype
-        if args.use_tiny_vae:
-            self.vae = AutoencoderTiny.from_pretrained(
-                "madebyollin/taesdxl", 
-                torch_dtype=self.DTYPE
-            ).to(self.device)
-        else:
-            self.vae = AutoencoderKL.from_pretrained(
-                args.model_id, 
-                subfolder="vae"
-            ).to(self.device).float()
-
-        # Initialize Generator
-        self.model = self.create_generator(args).to(dtype=self.DTYPE).to(self.device)
-
-        self.accelerator = accelerator
-        self.latent_resolution = args.latent_resolution
-        self.num_train_timesteps = args.num_train_timesteps
-
-        self.conditioning_timestep = args.conditioning_timestep 
-
-        self.scheduler = DDIMScheduler.from_pretrained(
-            args.model_id,
-            subfolder="scheduler"
-        )
-        self.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
-
-        # sampling parameters 
-        self.num_step = args.num_step 
-        self.conditioning_timestep = args.conditioning_timestep 
-
-
-    def create_generator(self, args):
-        generator = UNet2DConditionModel.from_pretrained(
-            args.model_id,
-            subfolder="unet"
-        ).to(self.DTYPE)
-
-        state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-        print(generator.load_state_dict(state_dict, strict=True))
-        generator.requires_grad_(False)
-        return generator 
-
-    def build_condition_input(self, width, height):
-        original_size = (width, height)
-        target_size = (width, height)
-        crop_top_left = (0, 0)
-
-        add_time_ids = list(original_size + crop_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids], device=self.device, dtype=self.DTYPE)
-        return add_time_ids
-
-    def _encode_prompts(self, prompts):
-        text_input_ids_one = self.tokenizer_one(
-            prompts,
-            padding="max_length",
-            max_length=self.tokenizer_one.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids
-
-        text_input_ids_two = self.tokenizer_two(
-            prompts,
-            padding="max_length",
-            max_length=self.tokenizer_two.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids
-
-        prompt_dict = {
-            'text_input_ids_one': text_input_ids_one.to(self.device),
-            'text_input_ids_two': text_input_ids_two.to(self.device)
-        }
-        return prompt_dict 
-    
-    @staticmethod
-    def _get_time():
-        torch.cuda.synchronize()
-        return time.time()
-
-    def sample(
-        self, noise, unet_added_conditions, prompt_embed
-    ):
-        alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
-
-        if self.num_step == 1:
-            all_timesteps = [self.conditioning_timestep]
-            step_interval = 0 
-        elif self.num_step == 4:
-            all_timesteps = [999, 749, 499, 249]
-            step_interval = 250 
-        else:
-            raise NotImplementedError()
-        
-        DTYPE = prompt_embed.dtype
-        
-        for constant in all_timesteps:
-            current_timesteps = torch.ones(len(prompt_embed), device=self.device, dtype=torch.long)  *constant
-            eval_images = self.model(
-                noise, current_timesteps, prompt_embed, added_cond_kwargs=unet_added_conditions
-            ).sample
-
-            eval_images = get_x0_from_noise(
-                noise, eval_images, alphas_cumprod, current_timesteps
-            ).to(self.DTYPE)
-
-            next_timestep = current_timesteps - step_interval 
-            noise = self.scheduler.add_noise(
-                eval_images, torch.randn_like(eval_images), next_timestep
-            ).to(DTYPE)  
-
-        eval_images = self.vae.decode(eval_images / self.vae.config.scaling_factor, return_dict=False)[0]
-        eval_images = ((eval_images + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1)
-        return eval_images 
-
-    @torch.no_grad()
-    def inference(
-        self,
-        prompts: list,
-        seed: int,
-        width: int,
-        height: int
-    ):
-        num_images = len(prompts)
-        print(f"Running model inference... images: {num_images}")
-
-        if seed == -1:
-            seed = np.random.randint(0, 1000000)
-
-        generator = torch.manual_seed(seed)
-
-        base_add_time_ids = self.build_condition_input(width, height)
-
-        add_time_ids = base_add_time_ids.repeat(num_images, 1)
-
-        noise = torch.randn(
-            num_images, 4, height // 8, width // 8, 
-            generator=generator
-        ).to(device=self.device, dtype=self.DTYPE) 
-
-        # Log the start time for encoding prompts
-        encode_start_time = self._get_time()
-        prompt_inputs = self._encode_prompts(prompts)
-        encode_end_time = self._get_time()
-        print(f"Encoding prompts took {(encode_end_time - encode_start_time):.2f} seconds")
-
-        # Log the start time for text encoding
-        text_encode_start_time = self._get_time()
-        batch_prompt_embeds, batch_pooled_prompt_embeds = self.text_encoder(prompt_inputs)
-        text_encode_end_time = self._get_time()
-        print(f"Text encoding took {(text_encode_end_time - text_encode_start_time):.2f} seconds")
-
-        unet_added_conditions = {
-            "time_ids": add_time_ids,
-            "text_embeds": batch_pooled_prompt_embeds.squeeze(1)
-        }
-
-        # Log the start time for sampling
-        sample_start_time = self._get_time()
-        eval_images = self.sample(
-            noise=noise,
-            unet_added_conditions=unet_added_conditions,
-            prompt_embed=batch_prompt_embeds
-        )
-        sample_end_time = self._get_time()
-        print(f"Sampling images took {(sample_end_time - sample_start_time):.2f} seconds")
-
-        output_image_list = [] 
-        for image in eval_images:
-            image_np = image.cpu().numpy()
-            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-            output_image_list.append(image_bgr)
-
-        # Log the total inference time
-        total_inference_time = sample_end_time - encode_start_time
-        print(f"Total inference time: {total_inference_time:.2f} seconds")
-
-        return output_image_list, eval_images
-
 app = FastAPI()
-
-# Initialize model once at startup
-args = argparse.Namespace(
-    latent_resolution=128,
-    num_train_timesteps=1000,
-    checkpoint_path='./sdxl_cond999.bin',
-    model_id='stabilityai/stable-diffusion-xl-base-1.0',
-    precision='float16',
-    use_tiny_vae=True,
-    conditioning_timestep=999,
-    num_step=4,
-    revision=None
-)
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True 
-
-accelerator = Accelerator()
-model = ModelWrapper(args, accelerator)
 
 @app.post('/generate')
 async def generate(request: Request):
@@ -258,18 +54,36 @@ async def generate(request: Request):
             return int(value)
         except (ValueError, TypeError):
             return default
+    width = max((convert_to_int(data.get('width', 1024), 1024)), 32)
+    height = max((convert_to_int(data.get('height', 1024), 1024)), 32)
 
-    width = convert_to_int(data.get('width', 1024), 1024)
-    height = convert_to_int(data.get('height', 1024), 1024)
+    min_pixels = 800 * 800
+    current_pixels = width * height
+
+    if current_pixels < min_pixels:
+        scale_factor = (min_pixels / current_pixels) ** 0.5
+        width = int(width * scale_factor)
+        height = int(height * scale_factor)
+
+    # esnsure height and width are divisible by 8
+    width = (width // 8) * 8
+    height = (height // 8) * 8
+
     seed = convert_to_int(data.get('seed', -1), -1)
-
     # Log the start time for the entire request processing
     request_start_time = time.time()
+    # Set the seed for reproducibility
+    if seed != -1:
+        generator = torch.manual_seed(seed)
+    else:
+        generator = None
 
+
+    prompt_embeds,pooled_prompt_embeds = compel(prompts)
     # Generate images for each prompt
-    all_images, all_images_tensor = model.inference(prompts, seed, width, height)
+    images = pipe(prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds, num_inference_steps=4, guidance_scale=0, generator=generator, width=width, height=height, timesteps=[999, 749, 499, 249]).images
 
-    if not all_images:
+    if not images:
         return JSONResponse(content={"error": "No images generated"}, status_code=500)
 
     response_content = []
@@ -281,11 +95,16 @@ async def generate(request: Request):
 
     # Process images in batch
     img_byte_arr_list = []
-    for image in all_images:
+    for idx, image in enumerate(images):
         img_byte_arr = io.BytesIO()
-        _, img_encoded = cv2.imencode('.png', image)
-        img_byte_arr.write(img_encoded.tobytes())
+        image.save(img_byte_arr, format='PNG')
         img_byte_arr_list.append(img_byte_arr.getvalue())
+
+        # Save image to a tmp file and log it
+        # tmp_file_path = f"/tmp/generated_image_{idx}.png"
+        # with open(tmp_file_path, "wb") as f:
+        #     f.write(img_byte_arr.getvalue())
+        # print(f"Image saved to {tmp_file_path}")
 
     # Convert images to base64
     img_base64_list = [base64.b64encode(img_byte_arr).decode('utf-8') for img_byte_arr in img_byte_arr_list]
@@ -299,7 +118,7 @@ async def generate(request: Request):
     # Log the start time for the safety checker
     safety_check_start_time = time.time()
     print("starting safety check")
-    concepts, has_nsfw_concepts_list = check_safety(all_images_tensor, safety_checker_adj=0.0)
+    concepts, has_nsfw_concepts_list = check_safety(images, safety_checker_adj=0.0)
     print("end safety check")
     # Log the end time for the safety checker
     safety_check_end_time = time.time()
@@ -344,4 +163,4 @@ async def generate(request: Request):
     return JSONResponse(content=response_content, media_type="application/json")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host='0.0.0.0', port=5000)
+    uvicorn.run(app, host='0.0.0.0', port=5002)
