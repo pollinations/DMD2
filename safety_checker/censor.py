@@ -37,13 +37,13 @@ def check_safety(x_image, safety_checker_adj: float):
 
     if safety_feature_extractor is None:
         safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-        safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+        safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id).to("cuda")
 
     # if x_image is an array of PIL images dont convert
     if isinstance(x_image, list) and not isinstance(x_image[0], Image.Image):
         x_image = numpy_to_pil(x_image)
     
-    safety_checker_input = safety_feature_extractor(x_image, return_tensors="pt")
+    safety_checker_input = safety_feature_extractor(x_image, return_tensors="pt").to("cuda")
     has_nsfw_concept, concepts,  = safety_checker(
         images=x_image,
         clip_input=safety_checker_input.pixel_values,
